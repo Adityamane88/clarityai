@@ -1,0 +1,14 @@
+[
+  {
+    "name": "Product principles retrieval",
+    "query": "Summarize the clarity principles from the uploaded handbook.",
+    "expected_doc_titles": ["clarity_principles"],
+    "expected_route": "local"
+  },
+  {
+    "name": "Current info should research",
+    "query": "What is the latest update today on AI regulation?",
+    "expected_doc_titles": [],
+    "expected_route": "research"
+  }
+]
