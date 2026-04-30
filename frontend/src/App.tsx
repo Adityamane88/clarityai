@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import ChatView from './components/ChatView'
 import Composer from './components/Composer'
 import RightPanel from './components/RightPanel'
@@ -39,6 +39,72 @@ function errorMessage(error: unknown): string {
   return 'Something went wrong.'
 }
 
+function getInitialTheme(): 'dark' | 'light' {
+  if (typeof window === 'undefined') return 'dark'
+
+  try {
+    const stored = window.localStorage.getItem('clarity-theme')
+    return stored === 'light' ? 'light' : 'dark'
+  } catch {
+    return 'dark'
+  }
+}
+
+function recordOf(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' ? (value as Record<string, unknown>) : null
+}
+
+function extractRouteInfo(value: unknown): RouteInfo | null {
+  const record = recordOf(value)
+  if (!record) return null
+
+  const direct = record.route ?? record.route_info ?? null
+  if (direct && typeof direct === 'object') return direct as RouteInfo
+
+  const metadata = recordOf(record.metadata)
+  const nested = metadata?.route ?? metadata?.route_info ?? null
+  if (nested && typeof nested === 'object') return nested as RouteInfo
+
+  return null
+}
+
+function extractResearchInfo(value: unknown): ResearchInfo | null {
+  const record = recordOf(value)
+  if (!record) return null
+
+  const direct = record.research ?? record.research_info ?? null
+  if (direct && typeof direct === 'object') return direct as ResearchInfo
+
+  const metadata = recordOf(record.metadata)
+  const nested = metadata?.research ?? metadata?.research_info ?? null
+  if (nested && typeof nested === 'object') return nested as ResearchInfo
+
+  return null
+}
+
+function extractSessionInsights(session: ChatSession): {
+  route: RouteInfo | null
+  research: ResearchInfo | null
+} {
+  const sessionRoute = extractRouteInfo(session)
+  const sessionResearch = extractResearchInfo(session)
+
+  if (sessionRoute || sessionResearch) {
+    return {
+      route: sessionRoute,
+      research: sessionResearch
+    }
+  }
+
+  const messages = Array.isArray(session.messages) ? session.messages : []
+  const lastAssistant = [...messages].reverse().find((message) => message.role === 'assistant')
+
+  return {
+    route: extractRouteInfo(lastAssistant),
+    research: extractResearchInfo(lastAssistant)
+  }
+}
+
 export default function App() {
   const [sessions, setSessions] = useState<ChatSession[]>([])
   const [activeSessionId, setActiveSessionId] = useState('')
@@ -49,17 +115,18 @@ export default function App() {
   const [mode, setMode] = useState<ChatMode>('balanced')
   const [researchMode, setResearchMode] = useState<ResearchMode>('auto')
   const [busy, setBusy] = useState(false)
-  const [uploading, setUploading] = useState(false)
+  const [uploadCount, setUploadCount] = useState(0)
   const [searching, setSearching] = useState(false)
   const [toast, setToast] = useState('')
   const [statusText, setStatusText] = useState('')
   const [routeInfo, setRouteInfo] = useState<RouteInfo | null>(null)
   const [researchInfo, setResearchInfo] = useState<ResearchInfo | null>(null)
   const [health, setHealth] = useState<HealthInfo | null>(null)
-  const [theme, setTheme] = useState<'dark' | 'light'>(() => {
-    const stored = localStorage.getItem('clarity-theme')
-    return stored === 'light' ? 'light' : 'dark'
-  })
+  const [theme, setTheme] = useState<'dark' | 'light'>(getInitialTheme)
+
+  const loadRequestRef = useRef(0)
+  const searchRequestRef = useRef(0)
+  const uploading = uploadCount > 0
 
   const activeSession = useMemo(
     () => sessions.find((session) => session.id === activeSessionId),
@@ -67,8 +134,17 @@ export default function App() {
   )
 
   useEffect(() => {
-    document.documentElement.dataset.theme = theme
-    localStorage.setItem('clarity-theme', theme)
+    if (typeof document !== 'undefined') {
+      document.documentElement.dataset.theme = theme
+    }
+
+    if (typeof window !== 'undefined') {
+      try {
+        window.localStorage.setItem('clarity-theme', theme)
+      } catch {
+        // Ignore localStorage failures.
+      }
+    }
   }, [theme])
 
   useEffect(() => {
@@ -95,37 +171,57 @@ export default function App() {
         api.listDocuments(),
         api.health().catch(() => null)
       ])
+
       setSessions(sortSessions(sessionList))
       setDocuments(documentList)
       setHealth(healthInfo)
+
       if (sessionList.length > 0) {
         await loadSession(sessionList[0].id)
-      } else {
-        const created = await api.createSession()
-        setSessions([created])
-        setActiveSessionId(created.id)
-        setMessages([])
-        setSelectedCitations([])
+        return
       }
+
+      const created = await api.createSession()
+      setSessions([created])
+      setActiveSessionId(created.id)
+      setMessages([])
+      setSelectedCitations([])
+      setRouteInfo(null)
+      setResearchInfo(null)
+      setStatusText('')
     } catch (error) {
       setToast(errorMessage(error))
     }
   }
 
-  async function loadSession(sessionId: string) {
+  async function loadSession(sessionId: string, options?: { preserveInsights?: boolean }) {
+    const requestId = ++loadRequestRef.current
     const session = await api.getSession(sessionId)
+
+    if (requestId !== loadRequestRef.current) return
+
     setActiveSessionId(session.id)
     setMessages(session.messages || [])
+
     const lastAssistant = [...(session.messages || [])].reverse().find((message) => message.role === 'assistant')
     setSelectedCitations(lastAssistant?.citations || [])
     setStatusText('')
+
+    const insights = extractSessionInsights(session)
+    if (!options?.preserveInsights || insights.route) {
+      setRouteInfo(insights.route)
+    }
+    if (!options?.preserveInsights || insights.research) {
+      setResearchInfo(insights.research)
+    }
+
     upsertSession(session)
   }
 
   async function handleNewSession() {
     try {
       const created = await api.createSession()
-      setSessions((current) => sortSessions([created, ...current]))
+      setSessions((current) => sortSessions([created, ...current.filter((session) => session.id !== created.id)]))
       setActiveSessionId(created.id)
       setMessages([])
       setSelectedCitations([])
@@ -139,19 +235,19 @@ export default function App() {
   }
 
   async function handleDeleteSession(sessionId: string) {
-    const confirmed = window.confirm('Delete this session?')
-    if (!confirmed) return
     try {
       await api.deleteSession(sessionId)
-      const remaining = sessions.filter((session) => session.id !== sessionId)
+      const remaining = sortSessions(sessions.filter((session) => session.id !== sessionId))
       setSessions(remaining)
-      if (activeSessionId === sessionId) {
-        if (remaining[0]) {
-          await loadSession(remaining[0].id)
-        } else {
-          await handleNewSession()
-        }
+
+      if (activeSessionId !== sessionId) return
+
+      if (remaining[0]) {
+        await loadSession(remaining[0].id)
+        return
       }
+
+      await handleNewSession()
     } catch (error) {
       setToast(errorMessage(error))
     }
@@ -160,28 +256,38 @@ export default function App() {
   async function handleSend(text: string) {
     if (busy) return
 
-    let sessionId = activeSessionId
-    if (!sessionId) {
-      const created = await api.createSession()
-      sessionId = created.id
-      setSessions((current) => sortSessions([created, ...current]))
-      setActiveSessionId(created.id)
-    }
+    const trimmed = text.trim()
+    if (!trimmed) return
 
-    const tempUser = makeTempMessage('user', sessionId, text)
-    const tempAssistant = makeTempMessage('assistant', sessionId, '')
-    setMessages((current) => [...current, tempUser, tempAssistant])
-    setSelectedCitations([])
-    setStatusText('Preparing response')
+    let finalSessionId = activeSessionId
+    let tempAssistantId = ''
+
     setBusy(true)
-
-    let finalSessionId = sessionId
+    setSelectedCitations([])
+    setRouteInfo(null)
+    setResearchInfo(null)
+    setStatusText('Preparing response')
 
     try {
+      let sessionId = activeSessionId
+      if (!sessionId) {
+        const created = await api.createSession()
+        sessionId = created.id
+        finalSessionId = created.id
+        setSessions((current) => sortSessions([created, ...current.filter((session) => session.id !== created.id)]))
+        setActiveSessionId(created.id)
+      }
+
+      const tempUser = makeTempMessage('user', sessionId, trimmed)
+      const tempAssistant = makeTempMessage('assistant', sessionId, '')
+      tempAssistantId = tempAssistant.id
+
+      setMessages((current) => [...current, tempUser, tempAssistant])
+
       await streamChat(
         {
           session_id: sessionId,
-          message: text,
+          message: trimmed,
           mode,
           research_mode: researchMode
         },
@@ -219,52 +325,67 @@ export default function App() {
           }
         }
       )
-      await loadSession(finalSessionId)
+
+      await loadSession(finalSessionId, { preserveInsights: true })
     } catch (error) {
-      setMessages((current) =>
-        current.map((message) =>
-          message.id === tempAssistant.id ? { ...message, content: `Error: ${errorMessage(error)}` } : message
+      if (tempAssistantId) {
+        setMessages((current) =>
+          current.map((message) =>
+            message.id === tempAssistantId ? { ...message, content: `Error: ${errorMessage(error)}` } : message
+          )
         )
-      )
+      }
       setToast(errorMessage(error))
       setStatusText('')
+      setRouteInfo(null)
+      setResearchInfo(null)
     } finally {
       setBusy(false)
     }
   }
 
   async function handleUpload(file: File) {
+    setUploadCount((current) => current + 1)
+
     try {
-      setUploading(true)
       const document = await api.uploadDocument(file)
       setDocuments((current) => [document, ...current.filter((item) => item.id !== document.id)])
       setToast(`Uploaded ${document.source_name}`)
     } catch (error) {
       setToast(errorMessage(error))
     } finally {
-      setUploading(false)
+      setUploadCount((current) => Math.max(0, current - 1))
     }
   }
 
   async function handleSearchKnowledge(query: string) {
-    if (!query.trim()) {
+    const trimmed = query.trim()
+    if (!trimmed) {
+      searchRequestRef.current += 1
       setSearchResponse(null)
+      setSearching(false)
       return
     }
+
+    const requestId = ++searchRequestRef.current
+
     try {
       setSearching(true)
-      const result = await api.searchKnowledge(query)
+      const result = await api.searchKnowledge(trimmed)
+      if (requestId !== searchRequestRef.current) return
       setSearchResponse(result)
     } catch (error) {
-      setToast(errorMessage(error))
+      if (requestId === searchRequestRef.current) {
+        setToast(errorMessage(error))
+      }
     } finally {
-      setSearching(false)
+      if (requestId === searchRequestRef.current) {
+        setSearching(false)
+      }
     }
   }
 
   async function handleDeleteDocument(documentId: string) {
-    const confirmed = window.confirm('Delete this document?')
-    if (!confirmed) return
     try {
       await api.deleteDocument(documentId)
       setDocuments((current) => current.filter((document) => document.id !== documentId))
@@ -301,7 +422,10 @@ export default function App() {
         activeSessionId={activeSessionId}
         theme={theme}
         health={health}
-        onSelect={(sessionId) => void loadSession(sessionId)}
+        onSelect={(sessionId) => {
+          if (busy) return
+          void loadSession(sessionId).catch((error) => setToast(errorMessage(error)))
+        }}
         onNewSession={() => void handleNewSession()}
         onDeleteSession={(sessionId) => void handleDeleteSession(sessionId)}
         onToggleTheme={() => setTheme((current) => (current === 'dark' ? 'light' : 'dark'))}
