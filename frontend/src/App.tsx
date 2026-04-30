@@ -165,34 +165,31 @@ export default function App() {
   }
 
   async function bootstrap() {
-    try {
-      const [sessionList, documentList, healthInfo] = await Promise.all([
-        api.listSessions(),
-        api.listDocuments(),
-        api.health().catch(() => null)
-      ])
+  try {
+    const healthInfo = await api.health().catch(() => null)
+    setHealth(healthInfo)
 
-      setSessions(sortSessions(sessionList))
-      setDocuments(documentList)
-      setHealth(healthInfo)
+    const [sessionList, documentList] = await Promise.all([
+      api.listSessions().catch(() => []),
+      api.listDocuments().catch(() => [])
+    ])
 
-      if (sessionList.length > 0) {
-        await loadSession(sessionList[0].id)
-        return
-      }
+    setSessions(sortSessions(sessionList))
+    setDocuments(documentList)
 
+    if (sessionList.length > 0) {
+      await loadSession(sessionList[0].id)
+    } else {
       const created = await api.createSession()
       setSessions([created])
       setActiveSessionId(created.id)
       setMessages([])
       setSelectedCitations([])
-      setRouteInfo(null)
-      setResearchInfo(null)
-      setStatusText('')
-    } catch (error) {
-      setToast(errorMessage(error))
     }
+  } catch (error) {
+    setToast(errorMessage(error))
   }
+}
 
   async function loadSession(sessionId: string, options?: { preserveInsights?: boolean }) {
     const requestId = ++loadRequestRef.current
