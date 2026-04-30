@@ -1,4 +1,4 @@
-import type {
+﻿import type {
   ChatMode,
   ChatSession,
   KnowledgeDocument,
@@ -9,7 +9,11 @@ import type {
   StreamStatus
 } from '../types'
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api'
+// Default to relative URLs so Vite's dev-server proxy (and nginx in prod) forwards
+// /api and /health to the backend. This sidesteps CORS entirely, regardless of which
+// port Vite ends up on. Set VITE_API_BASE_URL only if you serve the frontend from a
+// different origin than the backend.
+const API_BASE = ((import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')) + '/api'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
