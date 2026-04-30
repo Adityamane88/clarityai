@@ -70,7 +70,7 @@ function formatRelativeTime(value: string): string {
 
 function getHealthField(health: HealthInfo | null, field: string): unknown {
   if (!health || typeof health !== 'object') return undefined
-  return (health as Record<string, unknown>)[field]
+  return (health as unknown as Record<string, unknown>)[field]
 }
 
 function getSessionPreview(session: SessionLike): string {
