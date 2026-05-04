@@ -1,11 +1,14 @@
-import { Check, Copy, ExternalLink, Globe2, Quote, ScrollText, ThumbsDown, ThumbsUp } from 'lucide-react'
+import { Check, Copy, ExternalLink, Globe2, ImageIcon, Quote, ScrollText, ThumbsDown, ThumbsUp } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import type { ChatMessage, Citation } from '../types'
+import type { ChatMessage, Citation, ImageResult } from '../types'
+import ImageGallery from './ImageGallery'
 
 interface MessageBubbleProps {
   message: ChatMessage
+  // Live images streamed for the in-flight assistant message before `done`.
+  liveImages?: ImageResult[]
   onInspectSources: (citations: Citation[]) => void
   onFeedback: (messageId: string, rating: 'up' | 'down') => void
 }
@@ -205,7 +208,7 @@ const markdownComponents = {
   }
 }
 
-export default function MessageBubble({ message, onInspectSources, onFeedback }: MessageBubbleProps) {
+export default function MessageBubble({ message, liveImages, onInspectSources, onFeedback }: MessageBubbleProps) {
   const [copied, setCopied] = useState(false)
   const [expandedSources, setExpandedSources] = useState(false)
 
@@ -221,6 +224,14 @@ export default function MessageBubble({ message, onInspectSources, onFeedback }:
   const visibleCitations = expandedSources ? citations : citations.slice(0, 4)
   const content = typeof message.content === 'string' ? message.content : ''
   const hasContent = Boolean(content.trim())
+
+  // Prefer images saved on the message (post-`done`); fall back to live images
+  // streamed mid-flight for the still-incoming assistant turn.
+  const images = useMemo<ImageResult[]>(() => {
+    if (Array.isArray(message.images) && message.images.length > 0) return message.images
+    if (Array.isArray(liveImages) && liveImages.length > 0) return liveImages
+    return []
+  }, [message.images, liveImages])
 
   useEffect(() => {
     if (!copied) return undefined
@@ -245,22 +256,30 @@ export default function MessageBubble({ message, onInspectSources, onFeedback }:
           </time>
         </div>
 
+        {isAssistant && images.length > 0 ? (
+          <ImageGallery images={images} />
+        ) : null}
+
         <div className="bubble-content markdown">
           {hasContent ? (
             <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
               {content}
             </ReactMarkdown>
           ) : (
-            <div className="typing-placeholder">Working on your answer...</div>
+            <div className="typing-placeholder">
+              {isAssistant && images.length > 0 ? 'Writing about what you\'re seeing...' : 'Working on your answer...'}
+            </div>
           )}
         </div>
 
-        {isAssistant && citations.length > 0 ? (
+        {isAssistant && (citations.length > 0 || images.length > 0) ? (
           <div className="citation-row">
-            <button className="source-link-button" type="button" onClick={() => onInspectSources(citations)}>
-              <Quote size={14} />
-              View {citations.length} source{citations.length === 1 ? '' : 's'}
-            </button>
+            {citations.length > 0 ? (
+              <button className="source-link-button" type="button" onClick={() => onInspectSources(citations)}>
+                <Quote size={14} />
+                View {citations.length} source{citations.length === 1 ? '' : 's'}
+              </button>
+            ) : null}
 
             {visibleCitations.map((citation, index) => (
               <button
@@ -295,6 +314,12 @@ export default function MessageBubble({ message, onInspectSources, onFeedback }:
             {knowledgeCount > 0 ? (
               <span className="source-type-pill" title="Uploaded knowledge sources used in this answer">
                 <ScrollText size={12} /> {knowledgeCount} knowledge
+              </span>
+            ) : null}
+
+            {images.length > 0 ? (
+              <span className="source-type-pill" title="Images shown in this answer">
+                <ImageIcon size={12} /> {images.length} image{images.length === 1 ? '' : 's'}
               </span>
             ) : null}
 

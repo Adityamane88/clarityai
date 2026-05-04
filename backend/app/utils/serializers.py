@@ -10,6 +10,8 @@ def serialize_message(message: ChatMessage) -> dict:
         'role': message.role,
         'content': message.content,
         'citations': message.citations_json or [],
+        # `images_json` may not exist on older DBs; fall back gracefully.
+        'images': getattr(message, 'images_json', None) or [],
         'feedback_rating': message.feedback_rating,
         'feedback_note': message.feedback_note,
         'created_at': message.created_at.isoformat(),

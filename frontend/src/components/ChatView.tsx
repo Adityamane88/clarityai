@@ -2,21 +2,24 @@ import {
   ArrowDown,
   BookOpen,
   Compass,
+  ImageIcon,
   MessagesSquare,
   SearchCheck,
   ShieldCheck,
   Sparkles
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { ChatMessage, Citation, ResearchInfo, RouteInfo } from '../types'
+import type { ChatMessage, Citation, ImageResult, ImagesInfo, ResearchInfo, RouteInfo } from '../types'
 import MessageBubble from './MessageBubble'
 
 interface ChatViewProps {
   title: string
   messages: ChatMessage[]
+  liveImagesByMessageId?: Record<string, ImageResult[]>
   statusText: string
   routeInfo: RouteInfo | null
   researchInfo: ResearchInfo | null
+  imagesInfo?: ImagesInfo | null
   onInspectSources: (citations: Citation[]) => void
   onFeedback: (messageId: string, rating: 'up' | 'down') => void
   onSendSuggestion: (text: string) => void
@@ -25,7 +28,7 @@ interface ChatViewProps {
 const suggestions = [
   'Summarize the key principles in my uploaded documents and cite the strongest evidence.',
   'Compare two ways to handle customer escalations, explain the tradeoffs, and recommend one.',
-  'Walk me through debugging a slow API endpoint in priority order, with concrete checks.',
+  'Show me images of golden retrievers and tell me a bit about the breed.',
   'Help me turn a messy situation into a clear plan for this week with realistic next steps.'
 ]
 
@@ -109,9 +112,11 @@ function countUniqueSources(messages: ChatMessage[]): number {
 export default function ChatView({
   title,
   messages,
+  liveImagesByMessageId,
   statusText,
   routeInfo,
   researchInfo,
+  imagesInfo,
   onInspectSources,
   onFeedback,
   onSendSuggestion
@@ -140,6 +145,10 @@ export default function ChatView({
     typeof researchInfo?.count === 'number'
       ? researchInfo.count
       : latestAssistantMessage?.citations?.filter((citation) => citation.source_type === 'web').length || 0
+  const imageCount =
+    typeof imagesInfo?.count === 'number'
+      ? imagesInfo.count
+      : latestAssistantMessage?.images?.length || 0
   const uniqueSourceCount = useMemo(() => countUniqueSources(safeMessages), [safeMessages])
   const routeReason = humanize(routeInfo?.reason || null)
 
@@ -198,12 +207,13 @@ export default function ChatView({
         <div>
           <div className="chat-title">{title || 'New conversation'}</div>
           <div className="chat-subtitle">
-            Crisp answers first, evidence when it matters, and citations you can actually inspect.
+            Crisp answers first, evidence when it matters, images when they help, and citations you can actually inspect.
           </div>
         </div>
         <div className="status-pill-group" aria-label="Workspace capabilities">
           <span className="status-pill"><ShieldCheck size={14} /> Safety layer</span>
           <span className="status-pill"><BookOpen size={14} /> Source citations</span>
+          <span className="status-pill"><ImageIcon size={14} /> Image search</span>
           <span className="status-pill"><Sparkles size={14} /> Multi-turn memory</span>
         </div>
       </div>
@@ -225,6 +235,12 @@ export default function ChatView({
           <MessagesSquare size={15} />
           <span>{safeMessages.length} message{safeMessages.length === 1 ? '' : 's'}</span>
         </div>
+        {imageCount > 0 ? (
+          <div className="hero-chip">
+            <ImageIcon size={15} />
+            <span>{imageCount} image{imageCount === 1 ? '' : 's'} attached</span>
+          </div>
+        ) : null}
         {latestCitationCount > 0 ? (
           <div className="hero-chip">
             <BookOpen size={15} />
@@ -257,7 +273,7 @@ export default function ChatView({
         {safeMessages.length === 0 ? (
           <div className="empty-state">
             <div className="empty-hero">
-              Ask anything. The assistant can combine your uploaded knowledge, conversation context, and optional web research into one grounded answer.
+              Ask anything. The assistant can combine your uploaded knowledge, conversation context, optional web research, and images into one grounded answer.
             </div>
             <div className="empty-copy">
               It is strongest at synthesis, troubleshooting, comparisons, planning, and source-grounded responses. Open the right panel to upload files or inspect evidence behind any answer.
@@ -281,6 +297,7 @@ export default function ChatView({
           <MessageBubble
             key={message.id}
             message={message}
+            liveImages={liveImagesByMessageId?.[message.id]}
             onInspectSources={onInspectSources}
             onFeedback={onFeedback}
           />

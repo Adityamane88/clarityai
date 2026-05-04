@@ -1,20 +1,22 @@
 from __future__ import annotations
 
 """
-Chat orchestration for ClarityAI.
+Chat orchestration for ClarityAI - Elite version.
 
-Major improvements over the original:
-- Proper reference handling: any inline tag the model emits (e.g. [S1], [W1],
-  "(source 2)") is rewritten to a clean footnote like [1]; only footnote
-  numbers that match a real source survive. A polished "Sources" section is
-  appended after streaming finishes.
-- Cleaner streaming: token chunks are flushed as-is to the client; sanitization
-  happens once after the stream ends, and the final text written to DB matches
-  what the user sees.
-- Smarter fallback synthesis when the LLM is unavailable: produces a real,
-  readable answer from the strongest sources rather than a list of bullets.
-- Richer error mapping for httpx and provider errors.
-- Handles the "chat" route (casual messages) without forcing in fake citations.
+What's new vs the previous version:
+- Concurrent web research + image search using asyncio.gather, so adding
+  images doesn't slow down answers.
+- Image search is triggered when the user explicitly asks for images and
+  also (optionally) when the answer is being researched and the topic is
+  visual ("how does X look", "what is X").
+- A new SSE event `images` carries the image gallery to the frontend before
+  the text streams.
+- Self-identity questions are answered with a hand-written, paraphrased
+  template when no LLM is configured - never with web search results that
+  describe a different assistant.
+- Slightly tighter token streaming with newline-preserving fallback.
+- Cleaner ProviderUnavailable handling - the user always gets a useful
+  reply even when the LLM is down.
 """
 
 import asyncio
@@ -29,8 +31,9 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.db.models import ChatMessage, ChatSession
+from app.services.image_search import ImageResult, image_search
 from app.services.prompts import build_system_prompt, build_user_prompt
-from app.services.providers import ProviderUnavailableError, provider
+from app.services.providers import ProviderUnavailableError, pick_provider, provider
 from app.services.retrieval import retrieval_index
 from app.services.routing import choose_route
 from app.services.safety import assess_safety
@@ -45,18 +48,14 @@ settings = get_settings()
 # Patterns for citation cleanup
 # ---------------------------------------------------------------------------
 
-# Catches the model's stray internal tags: [S1], [W2], [S1, W2], (source 1), (Source: 2)
 INTERNAL_TAG_RE = re.compile(
     r"""
-    \[\s*(?:S|W)\d+(?:\s*,\s*(?:S|W)\d+)*\s*\]      # [S1], [S1, W2]
-    | \(\s*[Ss]ource[s]?\s*[:#]?\s*\d+(?:\s*,\s*\d+)*\s*\)   # (source 1) (Sources: 1, 2)
-    | \[\s*[Ss]ource\s*\d+\s*\]                     # [Source 1]
+    \[\s*(?:S|W)\d+(?:\s*,\s*(?:S|W)\d+)*\s*\]
+    | \(\s*[Ss]ource[s]?\s*[:#]?\s*\d+(?:\s*,\s*\d+)*\s*\)
+    | \[\s*[Ss]ource\s*\d+\s*\]
     """,
     re.VERBOSE,
 )
-
-# A footnote like [1] or [1, 3] that we want to keep — but only if it points
-# to a citation that actually exists.
 FOOTNOTE_RE = re.compile(r"\[\s*(\d+(?:\s*,\s*\d+)*)\s*\]")
 
 
@@ -70,7 +69,7 @@ def generate_title(message: str) -> str:
     if not words:
         return "New conversation"
     title = " ".join(words[:8]).strip()
-    return title[:60] + ("…" if len(title) > 60 else "")
+    return title[:60] + ("..." if len(title) > 60 else "")
 
 
 def sse_event(event_name: str, payload: dict) -> str:
@@ -108,7 +107,9 @@ def _source_name(source: dict) -> str:
     return title
 
 
-def _resolve_route_label(route_decision_label: str, local_sources: list[dict], web_sources: list[dict]) -> str:
+def _resolve_route_label(
+    route_decision_label: str, local_sources: list[dict], web_sources: list[dict]
+) -> str:
     if route_decision_label == "chat":
         return "chat"
     if local_sources and web_sources:
@@ -126,22 +127,18 @@ def _resolve_route_label(route_decision_label: str, local_sources: list[dict], w
 
 
 def _renumber_citations(citations: list[dict]) -> list[dict]:
-    """Assign clean public-facing footnote numbers (1..N) and a display name."""
     out = []
     for i, c in enumerate(citations, start=1):
         item = dict(c)
         item["number"] = i
         item["display_name"] = _source_name(item)
-        # `label` was the internal S1/W1; replace with the public footnote.
         item["label"] = f"[{i}]"
         out.append(item)
     return out
 
 
 def _strip_internal_tags(text: str) -> str:
-    """Remove [S1]/[W1]/(source 2)/[Source 1] etc."""
     cleaned = INTERNAL_TAG_RE.sub("", text)
-    # Tidy whitespace left behind
     cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
@@ -149,10 +146,6 @@ def _strip_internal_tags(text: str) -> str:
 
 
 def _filter_footnotes(text: str, valid_numbers: set[int]) -> str:
-    """Drop bracket footnotes whose numbers aren't in the citation list.
-
-    Keeps the bracket if at least one number is valid, dropping the invalid ones.
-    """
     def repl(match: re.Match) -> str:
         nums = [int(n.strip()) for n in match.group(1).split(",") if n.strip().isdigit()]
         valid = [n for n in nums if n in valid_numbers]
@@ -166,7 +159,6 @@ def _filter_footnotes(text: str, valid_numbers: set[int]) -> str:
 
 
 def _build_sources_section(citations: list[dict]) -> str:
-    """Render a clean Markdown 'Sources' section."""
     if not citations:
         return ""
     lines = ["", "---", "**Sources**"]
@@ -176,19 +168,13 @@ def _build_sources_section(citations: list[dict]) -> str:
         url = c.get("url")
         kind = "web" if c.get("source_type") == "web" else "file"
         if url:
-            lines.append(f"{n}. [{name}]({url}) — {kind}")
+            lines.append(f"{n}. [{name}]({url}) - {kind}")
         else:
-            lines.append(f"{n}. {name} — {kind}")
+            lines.append(f"{n}. {name} - {kind}")
     return "\n".join(lines)
 
 
 def _polish_answer(raw_text: str, citations: list[dict]) -> str:
-    """Final pass that runs on the assembled answer.
-
-    1. Strip internal tags ([S1], (source 2), …).
-    2. Filter footnote numbers that don't exist.
-    3. Append a Sources section (only if the answer actually used or has citations).
-    """
     text = _strip_internal_tags(raw_text)
     valid_numbers = {c["number"] for c in citations}
     text = _filter_footnotes(text, valid_numbers)
@@ -196,6 +182,22 @@ def _polish_answer(raw_text: str, citations: list[dict]) -> str:
     if citations:
         text += "\n" + _build_sources_section(citations)
     return text.strip()
+
+
+# ---------------------------------------------------------------------------
+# Self-identity hand-written answer (used when LLM is offline)
+# ---------------------------------------------------------------------------
+
+
+SELF_ID_FALLBACK = (
+    "I'm **ClarityAI**, a research-grade conversational assistant. I'm built on "
+    "an open-weights LLM and grounded in three things at once:\n\n"
+    "1. **Your uploaded knowledge** - PDFs, docs, notes, manuals you drop into the right panel.\n"
+    "2. **Conversation memory** - I remember the recent turns so follow-ups make sense.\n"
+    "3. **Optional web research** - when you ask for current or external facts, I can pull from trusted sources and cite them.\n\n"
+    "I'm not Claude, ChatGPT, Gemini, or any other named commercial assistant - just my own thing, "
+    "designed around grounded answers with citations you can actually inspect."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +213,7 @@ def _summarize_snippet(snippet: str, max_len: int = 260) -> str:
     last = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
     if last > 80:
         cut = cut[: last + 1]
-    return cut.rstrip() + "…"
+    return cut.rstrip() + "..."
 
 
 def _fallback_answer(
@@ -221,12 +223,23 @@ def _fallback_answer(
     medium_risk: bool,
     research_error: str | None,
     llm_error_hint: str | None,
+    intent: str,
+    image_count: int,
 ) -> str:
-    """Build a readable answer purely from retrieved evidence."""
+    # Self-identity: never use random web sources to answer "who are you".
+    if intent == "self_identity":
+        return SELF_ID_FALLBACK
+
     if not citations:
-        lines = [
-            "I don't have strong evidence for this yet, so I'd rather not guess.",
-        ]
+        if image_count > 0:
+            lines = [
+                f"I've pulled {image_count} image(s) for you - they're in the gallery above.",
+                "I don't have strong text evidence beyond that yet.",
+            ]
+        else:
+            lines = [
+                "I don't have strong evidence for this yet, so I'd rather not guess.",
+            ]
         if llm_error_hint:
             lines.append(llm_error_hint)
         if research_error:
@@ -236,10 +249,9 @@ def _fallback_answer(
             "question with one or two specific names, products, or terms."
         )
         if medium_risk:
-            lines.append("I'll keep the tone calm and practical — happy to help work through it.")
+            lines.append("I'll keep the tone calm and practical - happy to help work through it.")
         return "\n\n".join(lines)
 
-    # Compose a grounded summary in prose.
     locals_ = [c for c in citations if c.get("source_type") != "web"]
     webs = [c for c in citations if c.get("source_type") == "web"]
 
@@ -251,21 +263,24 @@ def _fallback_answer(
         header += f" ({llm_error_hint})"
     paras: list[str] = [header]
 
+    if image_count > 0:
+        paras.append(f"I've also attached {image_count} image(s) in the gallery above.")
+
     if locals_:
         paras.append("**From your uploaded knowledge:**")
         for c in locals_[:3]:
-            paras.append(f"- *{c['display_name']}* — {_summarize_snippet(c.get('snippet') or '')}")
+            paras.append(f"- *{c['display_name']}* - {_summarize_snippet(c.get('snippet') or '')}")
 
     if webs:
         paras.append("**From web research:**")
         for c in webs[:3]:
             url = c.get("url")
             link = f"[{c['display_name']}]({url})" if url else c["display_name"]
-            paras.append(f"- {link} — {_summarize_snippet(c.get('snippet') or '')}")
+            paras.append(f"- {link} - {_summarize_snippet(c.get('snippet') or '')}")
 
     if retrieval_confidence < settings.low_confidence_threshold:
         paras.append(
-            "Confidence is on the lower side — a narrower question or a more specific keyword "
+            "Confidence is on the lower side - a narrower question or a more specific keyword "
             "will improve this."
         )
 
@@ -279,9 +294,63 @@ def _fallback_answer(
 
 
 async def _stream_text(text: str) -> AsyncIterator[str]:
+    """Stream a string word-by-word so the UI feels alive on fallback paths."""
     for token in text.split(" "):
         yield token + " "
         await asyncio.sleep(0)
+
+
+# ---------------------------------------------------------------------------
+# Concurrent fetch helper
+# ---------------------------------------------------------------------------
+
+
+async def _gather_external(
+    user_message: str,
+    needs_research: bool,
+    needs_images: bool,
+    research_max: int,
+    image_max: int,
+) -> tuple[list[dict], list[ImageResult], str | None, str | None]:
+    """
+    Run web research and image search concurrently. Each side fails
+    independently - if research blows up, images can still arrive, and vice
+    versa.
+    Returns: (web_citations, images, research_error, image_error)
+    """
+    research_error: str | None = None
+    image_error: str | None = None
+
+    async def _research() -> list[dict]:
+        nonlocal research_error
+        if not needs_research:
+            return []
+        try:
+            sources = await web_research.search(user_message, max_results=research_max)
+            return [
+                source.to_citation(label=f"W{i}")
+                for i, source in enumerate(sources, start=1)
+            ]
+        except WebResearchUnavailableError as exc:
+            research_error = str(exc)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Web research failed: %s", exc)
+            research_error = "Web research failed for this turn."
+        return []
+
+    async def _images() -> list[ImageResult]:
+        nonlocal image_error
+        if not needs_images:
+            return []
+        try:
+            return await image_search.search(user_message, max_results=image_max)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Image search failed: %s", exc)
+            image_error = "Image search failed for this turn."
+            return []
+
+    web_citations, images = await asyncio.gather(_research(), _images())
+    return web_citations, images, research_error, image_error
 
 
 # ---------------------------------------------------------------------------
@@ -342,28 +411,29 @@ async def stream_chat_reply(
     )
 
     web_citations: list[dict] = []
+    images: list[ImageResult] = []
     research_error: str | None = None
-    if not safety.blocked and route_decision.needs_web_research:
-        yield {"type": "status", "stage": "researching", "message": "Researching trusted web sources"}
-        try:
-            research_sources = await web_research.search(
-                user_message, max_results=settings.research_max_results
-            )
-            web_citations = [
-                source.to_citation(label=f"W{i}")
-                for i, source in enumerate(research_sources, start=1)
-            ]
-        except WebResearchUnavailableError as exc:
-            research_error = str(exc)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Web research failed: %s", exc)
-            research_error = "Web research failed for this turn."
+    image_error: str | None = None
+
+    if not safety.blocked and (route_decision.needs_web_research or route_decision.needs_image_search):
+        if route_decision.needs_image_search:
+            yield {"type": "status", "stage": "researching", "message": "Researching and pulling images"}
+        else:
+            yield {"type": "status", "stage": "researching", "message": "Researching trusted web sources"}
+
+        web_citations, images, research_error, image_error = await _gather_external(
+            user_message=user_message,
+            needs_research=route_decision.needs_web_research,
+            needs_images=route_decision.needs_image_search,
+            research_max=settings.research_max_results,
+            image_max=6,
+        )
 
     raw_citations = [*local_citations, *web_citations]
     citations = _renumber_citations(raw_citations)
-    valid_numbers = {c["number"] for c in citations}
 
     resolved_route = _resolve_route_label(route_decision.route, local_citations, web_citations)
+    image_dicts = [img.to_dict() for img in images]
 
     # ----- Initial meta event -------------------------------------------------
     yield {
@@ -382,30 +452,56 @@ async def stream_chat_reply(
             "count": len(web_citations),
             "error": research_error,
         },
+        "images": {
+            "attempted": route_decision.needs_image_search,
+            "count": len(image_dicts),
+            "error": image_error,
+            "results": image_dicts,
+        },
     }
+
+    # Emit a separate `images` event so the frontend can render the gallery
+    # *before* text starts streaming - feels much faster.
+    if image_dicts:
+        yield {"type": "images", "results": image_dicts}
 
     # ----- Safety block early-return -----------------------------------------
     if safety.blocked:
         assistant_text = safety.message or "I cannot continue with that request."
-        # Stream the message so the UI feels live
         async for token in _stream_text(assistant_text):
             yield {"type": "token", "content": token}
         assistant_record = ChatMessage(
-            session_id=session.id, role="assistant", content=assistant_text, citations_json=[]
+            session_id=session.id,
+            role="assistant",
+            content=assistant_text,
+            citations_json=[],
         )
+        if image_dicts:
+            assistant_record.citations_json = []  # keep clean
         db.add(assistant_record)
         session.summary = _update_summary(session.summary or "", user_message, assistant_text)
         db.commit()
         db.refresh(session)
         db.refresh(assistant_record)
+
+        message_payload = serialize_message(assistant_record)
+        # Attach images on the wire so the UI can re-render historical turns.
+        message_payload["images"] = image_dicts
+
         yield {
             "type": "done",
-            "message": serialize_message(assistant_record),
+            "message": message_payload,
             "citations": [],
             "session": serialize_session(session),
             "safety": safety.to_dict(),
             "route": {"resolved_route": "safety_block"},
             "research": {"attempted": False, "count": 0, "error": None},
+            "images": {
+                "attempted": route_decision.needs_image_search,
+                "count": len(image_dicts),
+                "error": image_error,
+                "results": image_dicts,
+            },
         }
         return
 
@@ -417,6 +513,8 @@ async def stream_chat_reply(
                 mode=mode,
                 route=resolved_route,
                 medium_risk=safety.severity == "medium",
+                has_images=bool(image_dicts),
+                intent=route_decision.intent,
             ),
         }
     ]
@@ -433,6 +531,7 @@ async def stream_chat_reply(
                 retrieval_confidence=retrieval["confidence"],
                 session_summary=session.summary or "",
                 route_reason=route_decision.reason,
+                image_count=len(image_dicts),
             ),
         }
     )
@@ -444,8 +543,23 @@ async def stream_chat_reply(
     used_fallback = False
     llm_error_hint: str | None = None
 
+    selected_provider = pick_provider(
+        user_message=user_message,
+        route_decision=route_decision,
+        mode=mode,
+    )
+
+    # Surface which model/provider answered so the UI/logs can show it.
+    yield {
+        "type": "status",
+        "stage": "answering",
+        "message": f"Using {selected_provider.model}",
+        "provider": selected_provider.name,
+        "model": selected_provider.model,
+    }
+
     try:
-        async for token in provider.stream_chat(model_messages):
+        async for token in selected_provider.stream_chat(model_messages):
             response_parts.append(token)
             yield {"type": "token", "content": token}
     except ProviderUnavailableError as exc:
@@ -457,33 +571,36 @@ async def stream_chat_reply(
         status = exc.response.status_code if exc.response is not None else None
         if status == 401:
             llm_error_hint = (
-                "The LLM provider rejected the API key (HTTP 401). "
-                "Check LLM_API_KEY in backend/.env."
+                f"The {selected_provider.name!r} provider rejected the API key (HTTP 401). "
+                f"Check the relevant *_API_KEY in backend/.env."
             )
         elif status == 404:
             llm_error_hint = (
-                f"The model \"{settings.chat_model}\" was not found at "
-                f"{settings.llm_base_url}. Check CHAT_MODEL."
+                f"The model \"{selected_provider.model}\" was not found at "
+                f"{selected_provider.base_url}. Check the model name."
             )
         elif status == 429:
-            llm_error_hint = "The LLM provider rate-limited this request. Wait briefly and retry."
+            llm_error_hint = (
+                f"The {selected_provider.name!r} provider rate-limited this request. "
+                f"On Gemini's free tier, Pro is capped at 50 req/day and Flash at 1,500/day. "
+                f"Wait briefly and retry, or switch CHAT_MODEL/HEAVY_CHAT_MODEL to a less-loaded tier."
+            )
         elif status and 500 <= status < 600:
-            llm_error_hint = f"The LLM provider had a server error (HTTP {status}). Try again."
+            llm_error_hint = f"The {selected_provider.name!r} provider had a server error (HTTP {status}). Try again."
         else:
-            llm_error_hint = f"The LLM provider returned HTTP {status}."
-        logger.warning("LLM HTTP error: %s", llm_error_hint)
+            llm_error_hint = f"The {selected_provider.name!r} provider returned HTTP {status}."
+        logger.warning("LLM HTTP error (%s): %s", selected_provider.name, llm_error_hint)
     except (httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout):
         used_fallback = True
         llm_error_hint = (
-            f"Could not reach the LLM provider at {settings.llm_base_url}. "
-            "Check connectivity and LLM_BASE_URL."
+            f"Could not reach the {selected_provider.name!r} provider at {selected_provider.base_url}. "
+            "Check connectivity and the *_BASE_URL setting."
         )
     except Exception as exc:  # noqa: BLE001
         used_fallback = True
         llm_error_hint = f"Unexpected LLM error: {type(exc).__name__}."
         logger.exception("Unexpected LLM error during streaming")
 
-    # If the LLM produced nothing or failed, stream a fallback answer.
     if used_fallback or not "".join(response_parts).strip():
         fallback = _fallback_answer(
             user_message=user_message,
@@ -492,8 +609,9 @@ async def stream_chat_reply(
             medium_risk=safety.severity == "medium",
             research_error=research_error,
             llm_error_hint=llm_error_hint,
+            intent=route_decision.intent,
+            image_count=len(image_dicts),
         )
-        # Reset and stream the fallback so the UI shows a coherent answer
         response_parts = []
         async for token in _stream_text(fallback):
             response_parts.append(token)
@@ -509,15 +627,22 @@ async def stream_chat_reply(
         content=final_text,
         citations_json=citations,
     )
+    # Persist images on the message so reloads still see them.
+    if image_dicts and hasattr(assistant_record, "images_json"):
+        assistant_record.images_json = image_dicts
+
     db.add(assistant_record)
     session.summary = _update_summary(session.summary or "", user_message, final_text)
     db.commit()
     db.refresh(session)
     db.refresh(assistant_record)
 
+    message_payload = serialize_message(assistant_record)
+    message_payload["images"] = image_dicts
+
     yield {
         "type": "done",
-        "message": serialize_message(assistant_record),
+        "message": message_payload,
         "citations": citations,
         "session": serialize_session(session),
         "safety": safety.to_dict(),
@@ -527,7 +652,11 @@ async def stream_chat_reply(
             "count": len(web_citations),
             "error": research_error,
         },
-        # Tell the UI to render the polished, sanitized text instead of
-        # whatever it accumulated from raw stream tokens, if it wants to.
+        "images": {
+            "attempted": route_decision.needs_image_search,
+            "count": len(image_dicts),
+            "error": image_error,
+            "results": image_dicts,
+        },
         "final_text": final_text,
     }

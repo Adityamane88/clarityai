@@ -36,6 +36,9 @@ class ChatMessage(Base):
     role: Mapped[str] = mapped_column(String(20))
     content: Mapped[str] = mapped_column(Text)
     citations_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    # Elite addition: persist any images attached to the assistant turn so
+    # they survive a page refresh / session reload.
+    images_json: Mapped[list[dict]] = mapped_column(JSON, default=list, nullable=True)
     feedback_rating: Mapped[str | None] = mapped_column(String(12), nullable=True)
     feedback_note: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

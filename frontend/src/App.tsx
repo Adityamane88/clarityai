@@ -10,6 +10,8 @@ import type {
   ChatSession,
   Citation,
   HealthInfo,
+  ImageResult,
+  ImagesInfo,
   KnowledgeDocument,
   ResearchInfo,
   ResearchMode,
@@ -24,6 +26,7 @@ function makeTempMessage(role: 'user' | 'assistant', sessionId: string, content 
     role,
     content,
     citations: [],
+    images: [],
     created_at: new Date().toISOString(),
     feedback_rating: null,
     feedback_note: null
@@ -121,6 +124,9 @@ export default function App() {
   const [statusText, setStatusText] = useState('')
   const [routeInfo, setRouteInfo] = useState<RouteInfo | null>(null)
   const [researchInfo, setResearchInfo] = useState<ResearchInfo | null>(null)
+  const [imagesInfo, setImagesInfo] = useState<ImagesInfo | null>(null)
+  // Live images for the in-flight assistant message (before `done` arrives).
+  const [liveImagesByMessageId, setLiveImagesByMessageId] = useState<Record<string, ImageResult[]>>({})
   const [health, setHealth] = useState<HealthInfo | null>(null)
   const [theme, setTheme] = useState<'dark' | 'light'>(getInitialTheme)
 
@@ -165,31 +171,31 @@ export default function App() {
   }
 
   async function bootstrap() {
-  try {
-    const healthInfo = await api.health().catch(() => null)
-    setHealth(healthInfo)
+    try {
+      const healthInfo = await api.health().catch(() => null)
+      setHealth(healthInfo)
 
-    const [sessionList, documentList] = await Promise.all([
-      api.listSessions().catch(() => []),
-      api.listDocuments().catch(() => [])
-    ])
+      const [sessionList, documentList] = await Promise.all([
+        api.listSessions().catch(() => []),
+        api.listDocuments().catch(() => [])
+      ])
 
-    setSessions(sortSessions(sessionList))
-    setDocuments(documentList)
+      setSessions(sortSessions(sessionList))
+      setDocuments(documentList)
 
-    if (sessionList.length > 0) {
-      await loadSession(sessionList[0].id)
-    } else {
-      const created = await api.createSession()
-      setSessions([created])
-      setActiveSessionId(created.id)
-      setMessages([])
-      setSelectedCitations([])
+      if (sessionList.length > 0) {
+        await loadSession(sessionList[0].id)
+      } else {
+        const created = await api.createSession()
+        setSessions([created])
+        setActiveSessionId(created.id)
+        setMessages([])
+        setSelectedCitations([])
+      }
+    } catch (error) {
+      setToast(errorMessage(error))
     }
-  } catch (error) {
-    setToast(errorMessage(error))
   }
-}
 
   async function loadSession(sessionId: string, options?: { preserveInsights?: boolean }) {
     const requestId = ++loadRequestRef.current
@@ -199,6 +205,7 @@ export default function App() {
 
     setActiveSessionId(session.id)
     setMessages(session.messages || [])
+    setLiveImagesByMessageId({})
 
     const lastAssistant = [...(session.messages || [])].reverse().find((message) => message.role === 'assistant')
     setSelectedCitations(lastAssistant?.citations || [])
@@ -210,6 +217,9 @@ export default function App() {
     }
     if (!options?.preserveInsights || insights.research) {
       setResearchInfo(insights.research)
+    }
+    if (!options?.preserveInsights) {
+      setImagesInfo(null)
     }
 
     upsertSession(session)
@@ -225,6 +235,8 @@ export default function App() {
       setSearchResponse(null)
       setRouteInfo(null)
       setResearchInfo(null)
+      setImagesInfo(null)
+      setLiveImagesByMessageId({})
       setStatusText('')
     } catch (error) {
       setToast(errorMessage(error))
@@ -263,6 +275,7 @@ export default function App() {
     setSelectedCitations([])
     setRouteInfo(null)
     setResearchInfo(null)
+    setImagesInfo(null)
     setStatusText('Preparing response')
 
     try {
@@ -295,14 +308,46 @@ export default function App() {
             setSelectedCitations(payload.citations || [])
             setRouteInfo(payload.route)
             setResearchInfo(payload.research)
+            setImagesInfo(payload.images || null)
+            // If meta already includes images (rare but possible), seed them.
+            if (payload.images?.results?.length) {
+              setLiveImagesByMessageId((current) => ({
+                ...current,
+                [tempAssistant.id]: payload.images.results
+              }))
+            }
             setMessages((current) =>
               current.map((message) =>
-                message.id === tempAssistant.id ? { ...message, citations: payload.citations || [] } : message
+                message.id === tempAssistant.id
+                  ? {
+                      ...message,
+                      citations: payload.citations || [],
+                      images: payload.images?.results || []
+                    }
+                  : message
               )
             )
           },
           onStatus: async (payload) => {
             setStatusText(payload.message)
+          },
+          onImages: async (payload) => {
+            const incoming = payload.results || []
+            setLiveImagesByMessageId((current) => ({
+              ...current,
+              [tempAssistant.id]: incoming
+            }))
+            setImagesInfo((current) => ({
+              attempted: true,
+              count: incoming.length,
+              error: current?.error ?? null,
+              results: incoming
+            }))
+            setMessages((current) =>
+              current.map((message) =>
+                message.id === tempAssistant.id ? { ...message, images: incoming } : message
+              )
+            )
           },
           onToken: async (token) => {
             setMessages((current) =>
@@ -317,7 +362,25 @@ export default function App() {
             setSelectedCitations(payload.citations || payload.message.citations || [])
             setRouteInfo(payload.route)
             setResearchInfo(payload.research)
-            setMessages((current) => current.map((message) => (message.id === tempAssistant.id ? payload.message : message)))
+            setImagesInfo(payload.images || null)
+            setMessages((current) =>
+              current.map((message) =>
+                message.id === tempAssistant.id
+                  ? {
+                      ...payload.message,
+                      images: payload.message.images || payload.images?.results || []
+                    }
+                  : message
+              )
+            )
+            // The persisted message now carries images on its own; we can
+            // drop the live cache for this id.
+            setLiveImagesByMessageId((current) => {
+              if (!(tempAssistant.id in current)) return current
+              const next = { ...current }
+              delete next[tempAssistant.id]
+              return next
+            })
             setStatusText('')
           }
         }
@@ -336,6 +399,7 @@ export default function App() {
       setStatusText('')
       setRouteInfo(null)
       setResearchInfo(null)
+      setImagesInfo(null)
     } finally {
       setBusy(false)
     }
@@ -406,7 +470,7 @@ export default function App() {
   async function handleFeedback(messageId: string, rating: 'up' | 'down') {
     try {
       const updated = (await api.sendFeedback(messageId, rating)) as ChatMessage
-      setMessages((current) => current.map((message) => (message.id === updated.id ? updated : message)))
+      setMessages((current) => current.map((message) => (message.id === updated.id ? { ...updated, images: message.images } : message)))
     } catch (error) {
       setToast(errorMessage(error))
     }
@@ -432,9 +496,11 @@ export default function App() {
         <ChatView
           title={activeSession?.title || 'New conversation'}
           messages={messages}
+          liveImagesByMessageId={liveImagesByMessageId}
           statusText={statusText}
           routeInfo={routeInfo}
           researchInfo={researchInfo}
+          imagesInfo={imagesInfo}
           onInspectSources={setSelectedCitations}
           onFeedback={(messageId, rating) => void handleFeedback(messageId, rating)}
           onSendSuggestion={(text) => void handleSend(text)}

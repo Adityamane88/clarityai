@@ -1,18 +1,20 @@
-﻿import type {
+import type {
   ChatMode,
   ChatSession,
+  HealthInfo,
+  ImageResult,
   KnowledgeDocument,
   ResearchMode,
   SearchResponse,
   StreamDone,
+  StreamImages,
   StreamMeta,
   StreamStatus
 } from '../types'
 
 // Default to relative URLs so Vite's dev-server proxy (and nginx in prod) forwards
-// /api and /health to the backend. This sidesteps CORS entirely, regardless of which
-// port Vite ends up on. Set VITE_API_BASE_URL only if you serve the frontend from a
-// different origin than the backend.
+// /api and /health to the backend. Set VITE_API_BASE_URL only if you serve the
+// frontend from a different origin than the backend.
 const API_BASE = ((import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')) + '/api'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -33,16 +35,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  health: () =>
+  health: (): Promise<HealthInfo> =>
     fetch(`${API_BASE.replace(/\/api$/, '')}/health`).then(async (response) => {
       if (!response.ok) throw new Error(`Health check failed with ${response.status}`)
-      return response.json() as Promise<{
-        status: string
-        remote_llm_configured: boolean
-        chat_model: string | null
-        dense_retrieval_enabled: boolean
-        web_research_configured: boolean
-      }>
+      return response.json() as Promise<HealthInfo>
     }),
   listSessions: () => request<ChatSession[]>('/sessions'),
   createSession: (title?: string) =>
@@ -55,9 +51,15 @@ export const api = {
     request<{ status: string; session_id: string }>(`/sessions/${sessionId}`, { method: 'DELETE' }),
   listDocuments: () => request<KnowledgeDocument[]>('/knowledge/documents'),
   searchKnowledge: (query: string) => request<SearchResponse>(`/knowledge/search?q=${encodeURIComponent(query)}`),
-  reindexKnowledge: () => request<{ status: string; chunks: number; dense?: string }>('/knowledge/reindex', { method: 'POST' }),
+  reindexKnowledge: () =>
+    request<{ status: string; chunks: number; dense?: string }>('/knowledge/reindex', { method: 'POST' }),
   deleteDocument: (documentId: string) =>
     request<{ status: string; document_id: string }>(`/knowledge/documents/${documentId}`, { method: 'DELETE' }),
+  // Elite addition: standalone image search (independent of the chat stream).
+  searchImages: (query: string, limit = 6) =>
+    request<{ query: string; count: number; results: ImageResult[] }>(
+      `/images/search?q=${encodeURIComponent(query)}&limit=${limit}`
+    ),
   sendFeedback: (messageId: string, rating: 'up' | 'down') =>
     request(`/feedback/messages/${messageId}`, {
       method: 'POST',
@@ -81,6 +83,7 @@ export const api = {
 type StreamHandlers = {
   onMeta?: (payload: StreamMeta) => void | Promise<void>
   onStatus?: (payload: StreamStatus) => void | Promise<void>
+  onImages?: (payload: StreamImages) => void | Promise<void>
   onToken?: (token: string) => void | Promise<void>
   onDone?: (payload: StreamDone) => void | Promise<void>
   onEvent?: (eventName: string, payload: unknown) => void | Promise<void>
@@ -130,11 +133,19 @@ export async function streamChat(
       }
 
       if (!data) continue
-      const parsed = JSON.parse(data)
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(data)
+      } catch (err) {
+        // Bad frame - skip
+        continue
+      }
+
       await handlers.onEvent?.(eventName, parsed)
 
       if (eventName === 'meta') await handlers.onMeta?.(parsed as StreamMeta)
       if (eventName === 'status') await handlers.onStatus?.(parsed as StreamStatus)
+      if (eventName === 'images') await handlers.onImages?.(parsed as StreamImages)
       if (eventName === 'token') await handlers.onToken?.((parsed as { content?: string }).content || '')
       if (eventName === 'done') await handlers.onDone?.(parsed as StreamDone)
     }
